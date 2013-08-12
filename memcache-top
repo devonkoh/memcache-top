@@ -214,7 +214,10 @@ while ($i) {
 
     my @split = split(/:/,$instance);
     unless ( $split[1] ) {
-      $instance = $instance . ":" . $default_port;
+      # Make sure it's not a unix socket
+      if (! ( -S $split[0] ) ) {
+        $instance = $instance . ":" . $default_port;
+      }
       $port = $default_port;
     }
     else {
@@ -248,7 +251,11 @@ while ($i) {
 
     my $t0 = time();
 
-    $remote = IO::Socket::INET->new($instance);
+    if ( -S $instance ) {
+      $remote = IO::Socket::UNIX->new($instance);
+    } else {
+      $remote = IO::Socket::INET->new($instance);
+    }
     unless ( defined($remote) ) { 
       push @out,color 'red' if $usecolor;
       push @out,$instance . " is DOWN.\n";
@@ -516,7 +523,8 @@ memcache-top [OPTIONS]
 =item --instances <instance-definition>
 
 This option can be used multiple times or instances can be seperated by comma.
-A instance can be a ip-address (default port will be used) or ip-address:port.
+A instance can be a ip-address (default port will be used) or ip-address:port or
+a path to a unix socket
 
 =item --port <port>
 
@@ -576,7 +584,7 @@ Define a default set of your memcache servers seperated by comma.
 Just add the variable to your Shell-Profile (i.e. /etc/profile.d/memcache-top or ~/.bashrc).
 
 Example:
-   export MEMCACHE_SERVERS="1.1.1.1:22222,1.1.1.2,127.0.0.1"
+   export MEMCACHE_SERVERS="1.1.1.1:22222,1.1.1.2,127.0.0.1,/var/run/memcache.socket"
 
 =back
 
@@ -620,6 +628,8 @@ memcache-top, release v0.4
    at the end of the script.
    Added the ability to use this tool for logging to a pipe ("-l").
    Added the ability to monitor the uptime.
+ v0.8 - 2013-08-12 - wpoely86
+   Added support for unix sockets
 
 =head1 TODO
 
