@@ -3,66 +3,25 @@
 ################################################################################
 # memcache-top.pl
 #
-# "top" for memcache - watch the traffic and other stats in real-time.  Yoikes.
 #
-# NOTES:
+# This software is distributed with the "New BSD License"
+# http://www.opensource.org/licenses/bsd-license.php
 #
-#   If Getopt::Long is installed:
-#     - Specify instances w/ --instances (multiple times or comma separated)
-#     - Specify default port w/ --port (defaults to 11211)
-#     - Specify sleep time w/ --sleep (default 3)
-#     - Specify color output w/ --color (default) or --nocolor
-#     - Specify lifetime stats w/ --lifetime or --nolifetime (default)
-#       NOTE: lifetime stats break thresholds for evictions, bytes.
-#     - Specify read and write bytes w/ --bytes (default) or --nobytes
-#     - Specify get and set commands w/ --commands or --nocommands (default)
-#     - Specify cumulative numbers w/ --cumulative (don't use with lifetime)
-#     - Run a single time without clearing the screen, good for scripts and 
-#       the like: --oneoff
-#
-#   If Getopt::Long is not installed:
-#     - Specify sleep time by typing a number after the command.
-#   Specify instances in @default_instances.
-#   Specify thresholds by defining %threshold.
-#   Written against memcached v 1.2.3, but works fine w/ later versions.
-#
-# HISTORY:
-#
-# v0.3 - 2009-04-22 - ntang
-#   Minor cleanups.  First release to google code:
-#   http://code.google.com/p/memcache-top/
-# v0.4 - 2009-04-23 - ntang
-#   Added ability to specify color, sleep time, and servers on command line.
-#   Also added checks for Getopt::Long and Term::ANSIColor.
-#   Added $default_port = "11211" and padding for short server names.  Server 
-#     names over 23 characters inc. port will break the column lineups for now.
-# v0.4b - 2009-04-23 - ntang
-#   Added total capacity, and changed "SERVER" to "INSTANCE" to be more clear.
-#     Server now is the hostname, instance is hostname + port.  It will
-#     truncate the instance and/or server to fit inside the first column
-#     correctly.  (Yay!)  It'll also truncate long reads/ writes (or
-#     technically any number) to K or M or G if it exceeds certain limits for
-#     readability.
-# v0.5 - 2009-04-24 - ntang
-#   Cleaned up instances vs. servers so it's internally consistent.
-#   Redid printing so that now it stores it all and only refreshes/ prints when
-#     it has the full set of data.  Warning: major hackishness.
-#   Switched to per-second stats by default w/ lifetime stats available.
-# v0.6 - 2009-04-28 - ntang
-#   I lied.  One more change... the ability to specify read/write bytes, or 
-#     get/set commands, or both.  Bear in mind if you specify both you will 
-#     exceed the width of a standard terminal!  You've been warned.  :P
-#   Also, some minor display changes, etc. etc.
 #
 ################################################################################
 
 use strict;
 use IO::Socket;
 use Time::HiRes 'time';
+use IO::Handle;
+
+STDOUT->autoflush(1);
+STDERR->autoflush(1);
+
 
 my (@default_instances, @instances, $remote, $sleep, %threshold, %laststats,
     $usecolor, @keys, $default_port, $version, @out, $lifetime, $bytes, 
-    $commands, $cumulative, $oneoff);
+    $commands, $cumulative, $oneoff, $log, $uptime, $help);
 
 $version = "0.7";
 
@@ -77,6 +36,7 @@ $usecolor = 1;
     cache_hit		=> 60,		# Cache hit ratio
     usage		=> 90,		# % space used
     time		=> 5,		# Number of ms to run the stats query
+    uptime  => 60*5, # uptime less than 5 minutes
     evictions		=> 0,		# Number of evictions per second
     curr_connections	=> 3500,	# Number of current connections
     bytes_read		=> 1000000,	# Bytes read, per second
@@ -100,15 +60,24 @@ $commands = 0;
 $cumulative = 0;
 
 # Default time to sleep in-between refreshes.
-$sleep = 3;
+$sleep = 2;
 
 # Run a single time as a one-off without formatting:
 $oneoff = 0;
+
+# Show help
+$help = 0;
+
+# Don´t refresh screen, suitable for logging
+$log = 0;
 
 # List of servers/ ports to query.
 @default_instances = (
   '127.0.0.1:11211',
 );
+if (exists $ENV{MEMCACHE_SERVERS}){
+   @default_instances = split(/,/,$ENV{MEMCACHE_SERVERS});
+}
 
 # Default port to connect to, if not specified
 $default_port = "11211";
@@ -117,7 +86,7 @@ $default_port = "11211";
 ################################################################################
 
 @keys = ('usage', 'cache_hit', 'curr_connections', 'time', 'cmd_get', 'cmd_set',
-         'bytes_read', 'bytes_written', 'evictions', 'limit_maxbytes', 'bytes');
+         'bytes_read', 'bytes_written', 'evictions', 'limit_maxbytes', 'bytes', 'uptime');
 
 if (@ARGV) {
   eval { require Getopt::Long; };
@@ -126,7 +95,7 @@ if (@ARGV) {
       $sleep = $ARGV[0];
     }
     else {
-      die "USAGE: memcache-top.pl <optional number of seconds to sleep>\n";
+      die "USAGE: $0 <optional number of seconds to sleep>\n";
     }
   }
   else {
@@ -139,8 +108,11 @@ if (@ARGV) {
       'lifetime!'	=> \$lifetime,
       'bytes!'		=> \$bytes,
       'commands!'	=> \$commands,
+      'uptime!'   => \$uptime,
       'cumulative!'	=> \$cumulative,
-      'oneoff'		=> \$oneoff,
+      'oneoff!'		=> \$oneoff,
+      'log!'		   => \$log,
+      'help!'      => \$help,
     );
     if (@instances) {
       @instances = split(/,/,join(',',@instances));
@@ -153,8 +125,23 @@ else {
   @instances = @default_instances;
 }
 
+if ($help == 1){
+     if (system("perldoc $0") != 0){
+      print "NOTE: 'perldoc' needs to be usable - probably installing 'perldoc' would be a solution.\n";
+      print "      (or just read the documentation at sourcecodelevel at the end of the script)\n";
+     }
+     exit(1);
+}
+
 if ( $lifetime && $cumulative ) {
   $lifetime = 0;
+}
+
+# Automatically switch to logged output, if terminal is not interactive
+if (!(-t STDOUT)) {
+   $log = 1;
+   $usecolor = 0;
+   $SIG{TERM} = sub { };
 }
 
 if ( $usecolor ) {
@@ -163,7 +150,7 @@ if ( $usecolor ) {
   else { use Term::ANSIColor; }
 }
 
-if ( $oneoff ) {
+if ( $oneoff || $log ) {
   $usecolor = 0;
 }
 
@@ -172,20 +159,34 @@ my $i = 1;
 my (%original);
 
 while ($i) {
-
+  if ((@out <= 0) && !$log){
+      print "Calculating statistics, just wait $sleep seconds\n";
+  }
   @out = ();
 
-  unless ($oneoff) { push @out,"\033[2J"; }			# This clears the screen, yo.
+  if (!$oneoff && !$log){ 
+	 # This clears the screen, yo.
+    push @out,"\033[2J"; 
+  }
 
-  push @out,color 'bold' if $usecolor;
-  push @out,"\nmemcache-top v$version\t";
-  push @out,color 'reset' if $usecolor;
-  push @out,"(default port: " . sprintf("%5d",$default_port) . ", color: ";
-  push @out,"on," if $usecolor;
-  push @out,"off," unless $usecolor;
-  push @out," refresh: $sleep seconds)\n\n";
-  push @out,color 'bold' if $usecolor;
+  if ($log){
+    push(@out,"\n[".localtime()."]\n\n");
+  }else{
+     push @out,color 'bold' if $usecolor;
+     push @out,"\nmemcache-top v$version\t";
+     push @out,color 'reset' if $usecolor;
+     push @out,"(default port: " . sprintf("%5d",$default_port) . ", color: ";
+     push @out,"on," if $usecolor;
+     push @out,"off," unless $usecolor;
+     push @out," refresh: $sleep seconds)\n\n";
+     push @out,color 'bold' if $usecolor;
+  }
   push @out,"INSTANCE\t\tUSAGE\tHIT %\tCONN\tTIME\t";
+   
+  if ($uptime){
+       push @out,"UPTIME\t";
+  }
+
   if ( $lifetime || $cumulative ) {
     push @out,"EVICT\t";
     push @out,"GETS\tSETS\t" if $commands;
@@ -278,7 +279,10 @@ while ($i) {
     close $remote;
 
     my $t1 = time();
+
     $outstats{time} = ($t1 - $t0) * 1000;
+
+    $outstats{uptime} = $stats{uptime};
 
     if ( $lifetime || $cumulative) {
       foreach my $key ('cmd_get', 'cmd_set', 'get_hits', 'get_misses', 'evictions', 'bytes_read', 'bytes_written') {
@@ -292,7 +296,10 @@ while ($i) {
           $outstats{$key} = $stats{$key};
         }
       }
-      $outstats{cache_hit} = ( $stats{get_hits} / $stats{cmd_get} ) * 100;
+      $outstats{cache_hit} = 0;
+      if ($stats{cmd_get} > 0 ){
+         $outstats{cache_hit} = ( $stats{get_hits} / $stats{cmd_get} ) * 100;
+      }
     } else {
       foreach my $key ('cmd_get', 'cmd_set', 'get_hits', 'get_misses', 'evictions', 'bytes_read', 'bytes_written') {
         if ( defined ( $laststats{$instance}{$key} ) ) {
@@ -325,6 +332,18 @@ while ($i) {
     } else {
       threshold_print( $outstats{time}, $threshold{time}, 1, 0, 'ms', '%.1f');
     }
+   
+    if($uptime){
+      if ($outstats{uptime} > 3600*24){
+         threshold_print( $outstats{uptime}/60/60/24, $threshold{uptime}/60/60/24, 0, 0, 'd', '%.2f');
+      }
+      elsif ($outstats{uptime} > 3600){
+         threshold_print( $outstats{uptime}/60/60, $threshold{uptime}/60/60, 0, 0, 'h', '%.2f');
+      }else{
+         threshold_print( $outstats{uptime}/60, $threshold{uptime}/60, 0, 0, 'm', '%.2f');
+      }
+    }
+
     threshold_print( $outstats{evictions}, $threshold{evictions}, 1, 0, '', '%.1f');
     if ( $commands ) {
       threshold_print( $outstats{cmd_get}, $threshold{cmd_get}, 1, 0, '', '%.0f');
@@ -358,6 +377,18 @@ while ($i) {
   } else { 
     threshold_print( $tot{time}/$count, $threshold{time}, 1, 1, 'ms', '%.1f');
   }
+
+  if($uptime){
+    if ($tot{uptime} > 3600*24){
+       threshold_print( $tot{uptime}/60/60/24, $threshold{uptime}/60/60/24, 0, 0, 'd', '%.2f');
+    }
+    elsif ($tot{uptime} > 3600){
+       threshold_print( $tot{uptime}/60/60, $threshold{uptime}/60/60, 0, 0, 'h', '%.2f');
+    }else{
+       threshold_print( $tot{uptime}/60, $threshold{uptime}/60, 0, 0, 'm', '%.2f');
+    }
+  }
+
   threshold_print( $tot{evictions}/$count, $threshold{evictions}, 1, 1, '', '%.1f');
   if ( $commands ) {
     threshold_print( $tot{cmd_get}/$count, $threshold{cmd_get}, 1, 1, '', '%.0f');
@@ -377,6 +408,18 @@ while ($i) {
   } else {
     threshold_print( $tot{time}, $threshold{time}*$count, 1, 1, 'ms', '%.1f');
   }
+
+  if($uptime){
+    if ($tot{uptime} > 3600*24){
+       threshold_print( $tot{uptime}/60/60/24*$count, $threshold{uptime}/60/60/24*$count, 0, 0, 'd', '%.2f');
+    }
+    elsif ($tot{uptime} > 3600){
+       threshold_print( $tot{uptime}/60/60*$count, $threshold{uptime}/60/60*$count, 0, 0, 'h', '%.2f');
+    }else{
+       threshold_print( $tot{uptime}/60*$count, $threshold{uptime}/60*$count, 0, 0, 'm', '%.2f');
+    }
+  }
+
   threshold_print( $tot{evictions}, $threshold{evictions}*$count, 1, 1, '', '%.1f');
   if ( $commands ) {
     threshold_print( $tot{cmd_get}, $threshold{cmd_get}*$count, 1, 1, '', '%.0f');
@@ -388,7 +431,10 @@ while ($i) {
   }
   push @out,color 'reset' if $usecolor;
   push @out,"\n";
-  unless ($oneoff) { push @out,"(ctrl-c to quit.)\n"; }
+
+  if (!$oneoff && !$log){
+    push @out,"(ctrl-c to quit.)\n"; 
+  }
   sleep($sleep);
 
   print @out;
@@ -448,4 +494,147 @@ sub threshold_print {
   push @out,color $offcolor if $usecolor;
   push @out,"\t";
 }
+
+#
+
 ################################################################################
+
+__END__
+
+=head1 NAME
+
+memcache-top - "top" for memcache, watch the traffic and other stats in real-time.
+
+=head1 SYNOPSIS
+
+memcache-top [OPTIONS]
+
+=head1 OPTIONS
+
+=over
+
+=item --instances <instance-definition>
+
+This option can be used multiple times or instances can be seperated by comma.
+A instance can be a ip-address (default port will be used) or ip-address:port.
+
+=item --port <port>
+
+The default port for memcache-instances. 
+
+=item --sleep <time>
+
+Intervall of seconds between updates. Default is 2 seconds
+
+=item --color or --nocolor
+
+enable or disable colored output
+
+=item --lifetime or --nolifetime
+
+Activate lifetime stats, cumulate stats.
+Lifetime stats break thresholds for evictions and bytes.
+
+=item --bytes (default) or --nobytes
+
+Show stats in read/write bytes.
+
+=item --commands or --nocommands (default)
+
+Show statisics about get/set commands.
+
+=item --uptime 
+
+Show statisics about uptimes of the nodes. Alarm threshold is <5 minutes.
+
+=item --cumulative
+
+Create cumulative statistics (don't use with lifetime)
+
+=item --oneoff
+
+Run a single time without clearing the screen, good for scripts and 
+
+=item --log
+
+Run without refreshing the screen, colors and timestamps
+
+=back
+
+=head1 DESCRIPTION
+
+B<memcache-top> is a tool for monitoriing/analyzing memache instances in real-time
+It is written against memcached v 1.2.3, but works fine with later versions.
+
+=head1 ENVIRONMENT VARIABLES
+
+=over
+
+=item MEMCACHE_SERVERS
+
+Define a default set of your memcache servers seperated by comma.
+Just add the variable to your Shell-Profile (i.e. /etc/profile.d/memcache-top or ~/.bashrc).
+
+Example:
+   export MEMCACHE_SERVERS="1.1.1.1:22222,1.1.1.2,127.0.0.1"
+
+=back
+
+=head1 BUGS
+
+features :-)
+
+=head1 VERSION
+
+memcache-top, release v0.4
+
+=head1 HISTORY
+
+ v0.3 - 2009-04-22 - ntang
+   Minor cleanups.  First release to google code:
+   http://code.google.com/p/memcache-top/
+ v0.4 - 2009-04-23 - ntang
+   Added ability to specify color, sleep time, and servers on command line.
+   Also added checks for Getopt::Long and Term::ANSIColor.
+   Added $default_port = "11211" and padding for short server names.  Server 
+     names over 23 characters inc. port will break the column lineups for now.
+ v0.4b - 2009-04-23 - ntang
+   Added total capacity, and changed "SERVER" to "INSTANCE" to be more clear.
+     Server now is the hostname, instance is hostname + port.  It will
+     truncate the instance and/or server to fit inside the first column
+     correctly.  (Yay!)  It'll also truncate long reads/ writes (or
+     technically any number) to K or M or G if it exceeds certain limits for
+     readability.
+ v0.5 - 2009-04-24 - ntang
+   Cleaned up instances vs. servers so it's internally consistent.
+   Redid printing so that now it stores it all and only refreshes/ prints when
+     it has the full set of data.  Warning: major hackishness.
+   Switched to per-second stats by default w/ lifetime stats available.
+ v0.6 - 2009-04-28 - ntang
+   I lied.  One more change... the ability to specify read/write bytes, or 
+     get/set commands, or both.  Bear in mind if you specify both you will 
+     exceed the width of a standard terminal!  You've been warned.  :P
+   Also, some minor display changes, etc. etc.
+ v0.7 - 2009-04-28 - scoopex666
+   Added a option "-h" to show documentation with perldoc and basic documentation
+   at the end of the script.
+   Added the ability to use this tool for logging to a pipe ("-l").
+   Added the ability to monitor the uptime.
+
+=head1 TODO
+
+  - make defaults/tresholds configurable
+  - add more metrics
+  - improve manpage
+
+=head1 LICENSE
+
+This software is distributed with the "New BSD License"
+(see: http://www.opensource.org/licenses/bsd-license.php)
+
+=head1 AUTHOR
+
+ Marc Schoechlin <ms@256bit.org>
+ Nicholas Tang <..TODO..> 
+
+=cut
