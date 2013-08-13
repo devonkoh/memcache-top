@@ -235,7 +235,12 @@ while ($i) {
           $server = $instance;
         }
         else {
-          $server = substr($split[0],0,23);
+          if ( -S $split[0] ) {
+            $server = substr($split[0],-23);
+          }
+          else {
+            $server = substr($split[0],0,23);
+          }
         }
       }
     }
